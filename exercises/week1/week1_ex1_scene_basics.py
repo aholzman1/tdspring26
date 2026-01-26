@@ -1,7 +1,6 @@
 """Week 1 Exercise 1: bootstrap a Blender scene and animate a cube via bpy."""
 
 import bpy
-from mathutils import Vector
 from pathlib import Path
 
 FRAME_END = 30
@@ -30,7 +29,7 @@ def clear_objects() -> None:
 def create_ground() -> bpy.types.Object:
     bpy.ops.mesh.primitive_plane_add(size=20, location=(0.0, 0.0, -1.0))
     plane = bpy.context.active_object
-    material = bpy.data.materials.new(name="GroundMaterial")
+    material = bpy.data.materials.new(name="GroundMaterial")  # type: ignore
     material.use_nodes = True
     bsdf = material.node_tree.nodes.get("Principled BSDF")
     bsdf.inputs[0].default_value = (0.1, 0.1, 0.12, 1.0)
@@ -45,7 +44,7 @@ def create_cube() -> bpy.types.Object:
     cube = bpy.context.active_object
     cube.name = "Week1Cube"
     cube.data.materials.clear()
-    material = bpy.data.materials.new(name="CubeMaterial")
+    material = bpy.data.materials.new(name="CubeMaterial")  # type: ignore
     material.use_nodes = True
     bsdf = material.node_tree.nodes.get("Principled BSDF")
     bsdf.inputs[0].default_value = (0.8, 0.2, 0.15, 1.0)
@@ -56,9 +55,9 @@ def create_cube() -> bpy.types.Object:
 def keyframe_cube(cube: bpy.types.Object) -> None:
     cube.animation_data_clear()
     timeline = (
-        (1, Vector((0.0, 0.0, 0.0))),
-        (15, Vector((0.0, -10.0, 0.0))),
-        (30, Vector((30.0, 0.0, 0.0))),
+        (1, (0.0, 0.0, 0.0)),
+        (15, (0.0, -10.0, 0.0)),
+        (30, (30.0, 0.0, 0.0)),
     )
     for frame, location in timeline:
         cube.location = location
