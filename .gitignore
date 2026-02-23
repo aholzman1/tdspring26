@@ -47,4 +47,6 @@ Thumbs.db
 # Dependencies
 venv/
 env/
+characters/
+pointclouds/
 .venv/
