@@ -17,15 +17,108 @@ from typing_extensions import Annotated
 app = typer.Typer(help="Import FBX and create TikTok-style camera automation")
 
 SAVE_NAME = "week2ex4_tiktok.blend"
+RADIANCE_FIELD_BLEND = Path(__file__).parent / "radiancefield.blend"
+RADIANCE_FIELD_NODE_GROUP = "RadianceField"
 FRAME_STEP = 5  # Bake keyframes every N frames
 CAMERA_DISTANCE = 2.5  # Distance from target in meters
 CAMERA_HEIGHT_OFFSET = 1.5  # Height above target center
 TARGET_BONE_NAME = "mixamorig:Hips"  # Common Mixamo bone name
 
 
+import math
+
+
+def import_ply(ply_path: Path) -> list[bpy.types.Object]:
+    """Import a PLY pointcloud file and return the imported objects."""
+    if not ply_path.exists():
+        typer.secho(f"Error: PLY file not found: {ply_path}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Importing PLY: {ply_path}")
+    objects_before = set(bpy.data.objects)
+    bpy.ops.wm.ply_import(filepath=str(ply_path))
+    objects_after = set(bpy.data.objects)
+    imported = list(objects_after - objects_before)
+    typer.secho(f"✓ Imported {len(imported)} object(s) from {ply_path.name}", fg=typer.colors.GREEN)
+    return imported
+
+
+def name_and_rotate_pointcloud(
+    obj: bpy.types.Object,
+    name: str = "Pointcloud",
+    rotation_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> None:
+    """Rename the object and apply rotation (in degrees, converted to radians)."""
+    obj.name = name
+    obj.rotation_euler = (
+        math.radians(rotation_deg[0]),
+        math.radians(rotation_deg[1]),
+        math.radians(rotation_deg[2]),
+    )
+    typer.secho(
+        f"✓ Named '{name}', rotation={rotation_deg[0]}°, {rotation_deg[1]}°, {rotation_deg[2]}°",
+        fg=typer.colors.GREEN,
+    )
+
+
+def append_radiance_field_node_group(blend_path: Path) -> bpy.types.NodeTree:
+    """Append the RadianceField node group from a .blend file."""
+    if not blend_path.exists():
+        typer.secho(f"Error: radiancefield.blend not found: {blend_path}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    # Check if already appended
+    if RADIANCE_FIELD_NODE_GROUP in bpy.data.node_groups:
+        typer.echo(f"Node group '{RADIANCE_FIELD_NODE_GROUP}' already loaded.")
+        return bpy.data.node_groups[RADIANCE_FIELD_NODE_GROUP]
+
+    typer.echo(f"Appending node group '{RADIANCE_FIELD_NODE_GROUP}' from {blend_path.name}")
+    bpy.ops.wm.append(
+        filepath=str(blend_path) + f"/NodeTree/{RADIANCE_FIELD_NODE_GROUP}",
+        directory=str(blend_path) + "/NodeTree/",
+        filename=RADIANCE_FIELD_NODE_GROUP,
+    )
+
+    if RADIANCE_FIELD_NODE_GROUP not in bpy.data.node_groups:
+        typer.secho(
+            f"Error: Could not find node group '{RADIANCE_FIELD_NODE_GROUP}' after append.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    typer.secho(f"✓ Appended node group '{RADIANCE_FIELD_NODE_GROUP}'", fg=typer.colors.GREEN)
+    return bpy.data.node_groups[RADIANCE_FIELD_NODE_GROUP]
+
+
+def apply_radiance_field_to_object(
+    obj: bpy.types.Object, node_group: bpy.types.NodeTree
+) -> None:
+    """Add a GeometryNodes modifier to obj and assign the RadianceField node group."""
+    mod = obj.modifiers.new(name="GeometryNodes", type="NODES")
+    mod.node_group = node_group
+    typer.secho(
+        f"✓ Applied '{RADIANCE_FIELD_NODE_GROUP}' geometry nodes to '{obj.name}'",
+        fg=typer.colors.GREEN,
+    )
+
+
+def set_bounding_box(
+    obj: bpy.types.Object,
+    bbox: tuple[float, float, float] = (4.0, 4.0, 8.0),
+) -> None:
+    """Set Socket_3 (bounding box vector) on the GeometryNodes modifier."""
+    mod = obj.modifiers.get("GeometryNodes")
+    if mod is None:
+        typer.secho(f"Warning: No GeometryNodes modifier on '{obj.name}'", fg=typer.colors.YELLOW)
+        return
+    mod["Socket_3"] = bbox
+    typer.secho(
+        f"✓ Bounding box set to {bbox} on '{obj.name}'",
+        fg=typer.colors.GREEN,
+    )
+
+
 def reset_scene() -> None:
-    """Reset to a clean scene with proper settings."""
-    bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.context.scene.render.engine = "BLENDER_EEVEE"
 
     # TikTok aspect ratio: 9:16 (vertical video)
@@ -51,8 +144,8 @@ def import_fbx(fbx_path: Path) -> list[bpy.types.Object]:
     # Get objects before import
     objects_before = set(bpy.data.objects)
 
-    # Import FBX
-    bpy.ops.import_scene.fbx(filepath=str(fbx_path))
+    # Import FBX (bpy 5.x: operator moved to bpy.ops.wm.fbx_import)
+    bpy.ops.wm.fbx_import(filepath=str(fbx_path))
 
     # Get newly imported objects
     objects_after = set(bpy.data.objects)
@@ -146,8 +239,6 @@ def setup_camera_tracking(
         )
 
         # Calculate rotation to look at target
-        import math
-
         rot_quat = camera.rotation_euler.to_quaternion()
         track_quat = direction.to_track_quat("-Z", "Y")
         camera.rotation_euler = track_quat.to_euler()
@@ -287,6 +378,112 @@ def create(
     if target_bone:
         typer.echo(f"Tracking bone: {target_bone}")
     typer.echo(f"Frame range: {start_frame} - {end_frame}")
+
+
+@app.command("import-pointcloud")
+def import_pointcloud_cmd(
+    pointcloud: Annotated[
+        Optional[Path],
+        typer.Option("--pointcloud", "-p", help="Path to a single .ply pointcloud file"),
+    ] = None,
+    pointcloud_dir: Annotated[
+        Optional[Path],
+        typer.Option("--pointcloud-dir", "-d", help="Directory of .ply files to import all"),
+    ] = None,
+    rotation: Annotated[
+        Optional[list[float]],
+        typer.Option("--rotation", "-r", help="Rotation in degrees: X Y Z (pass three times)"),
+    ] = None,
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", "-o", help="Output .blend file path"),
+    ] = None,
+    radiance_field_blend: Annotated[
+        Path,
+        typer.Option("--radiance-field", help="Path to radiancefield.blend"),
+    ] = RADIANCE_FIELD_BLEND,
+    bounding_box: Annotated[
+        Optional[list[float]],
+        typer.Option("--bounding-box", "-b", help="Bounding box X Y Z (pass three times, default 4 4 8)"),
+    ] = None,
+) -> None:
+    """Import one or all .ply pointclouds, apply rotation, name them 'Pointcloud',
+    and attach the RadianceField geometry node group.
+
+    Examples:
+        python script.py import-pointcloud --pointcloud pointclouds/Hydrant.ply --rotation 0 --rotation 0 --rotation 45
+        python script.py import-pointcloud --pointcloud-dir pointclouds/
+    """
+    typer.secho("☁️  Pointcloud Import", fg=typer.colors.CYAN, bold=True)
+    typer.echo("=" * 50)
+
+    if pointcloud is None and pointcloud_dir is None:
+        typer.secho("Error: Provide --pointcloud or --pointcloud-dir.", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    # Collect files to import
+    if pointcloud is not None:
+        ply_files = [pointcloud]
+    else:
+        pointcloud_dir = pointcloud_dir.expanduser().resolve()
+        ply_files = sorted(pointcloud_dir.glob("*.ply"))
+        if not ply_files:
+            typer.secho(f"Error: No .ply files found in {pointcloud_dir}", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        typer.echo(f"Found {len(ply_files)} .ply file(s) in {pointcloud_dir}")
+
+    # Parse rotation (defaults to 0, 0, 0). +90° X base offset corrects PLY Z-forward → Z-up.
+    rot: tuple[float, float, float]
+    if rotation is not None:
+        if len(rotation) != 3:
+            typer.secho("Error: --rotation requires exactly 3 values (X Y Z).", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        rot = (rotation[0] + 90.0, rotation[1], rotation[2])
+    else:
+        rot = (90.0, 0.0, 0.0)
+
+    typer.echo("1. Resetting scene...")
+    reset_scene()
+    ensure_object_mode()
+
+    typer.echo(f"2. Appending RadianceField node group from {radiance_field_blend.name}...")
+    node_group = append_radiance_field_node_group(radiance_field_blend)
+
+    for i, ply_file in enumerate(ply_files):
+        typer.echo(f"3. Importing pointcloud {i + 1}/{len(ply_files)}: {ply_file.name}")
+        imported = import_ply(ply_file)
+        if not imported:
+            typer.secho(f"Warning: No objects imported from {ply_file.name}", fg=typer.colors.YELLOW)
+            continue
+
+        # Use the first (and typically only) imported mesh object
+        obj = next((o for o in imported if o.type == "MESH"), imported[0])
+
+        typer.echo(f"4. Naming and rotating '{obj.name}'...")
+        obj_name = "Pointcloud" if len(ply_files) == 1 else f"Pointcloud_{ply_file.stem}"
+        name_and_rotate_pointcloud(obj, name=obj_name, rotation_deg=rot)
+
+        typer.echo("5. Applying RadianceField geometry nodes...")
+        apply_radiance_field_to_object(obj, node_group)
+
+        typer.echo("6. Setting bounding box...")
+        if bounding_box is not None:
+            if len(bounding_box) != 3:
+                typer.secho("Error: --bounding-box requires exactly 3 values (X Y Z).", fg=typer.colors.RED)
+                raise typer.Exit(code=1)
+            bbox = (bounding_box[0], bounding_box[1], bounding_box[2])
+        else:
+            bbox = (4.0, 4.0, 8.0)
+        set_bounding_box(obj, bbox)
+
+    typer.echo("7. Saving blend file...")
+    save_blend_file(output)
+
+    typer.echo("=" * 50)
+    typer.secho("✨ Pointcloud import complete!", fg=typer.colors.GREEN, bold=True)
+    typer.echo(f"Imported {len(ply_files)} pointcloud(s) with rotation {rot}")
+    typer.echo(f"Bounding box: {bbox}")
+    typer.echo("Open the .blend in Blender to verify the GeometryNodes modifier.")
 
 
 if __name__ == "__main__":

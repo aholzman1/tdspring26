@@ -54,8 +54,8 @@ def import_fbx(fbx_path: Path) -> list[bpy.types.Object]:
     # Get objects before import
     objects_before = set(bpy.data.objects)
 
-    # Import FBX
-    bpy.ops.import_scene.fbx(filepath=str(fbx_path))
+    # Import FBX (bpy 5.x: operator moved to bpy.ops.wm.fbx_import)
+    bpy.ops.wm.fbx_import(filepath=str(fbx_path))
 
     # Get newly imported objects
     objects_after = set(bpy.data.objects)
@@ -222,6 +222,60 @@ def remove_imported_objects(imported_objects: list[bpy.types.Object]) -> None:
             bpy.data.objects.remove(obj, do_unlink=True)
 
 
+def import_pointcloud(
+    ply_path: Path,
+    rotation_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    name: str = "Pointcloud",
+) -> bpy.types.Object:
+    """Import a PLY pointcloud, name it, and apply rotation.
+
+    Args:
+        ply_path: Path to the .ply file.
+        rotation_xyz: Rotation in degrees for X, Y, Z axes.
+        name: Name to assign the imported object (Blender will auto-increment
+              to 'Pointcloud.001' etc. when multiple clouds exist in the scene).
+
+    Returns:
+        The imported pointcloud object.
+    """
+    import math
+
+    if not ply_path.exists():
+        typer.secho(f"Error: PLY file not found: {ply_path}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"  Importing: {ply_path.name}")
+    objects_before = set(bpy.data.objects)
+
+    bpy.ops.wm.ply_import(filepath=str(ply_path))
+
+    objects_after = set(bpy.data.objects)
+    new_objects = list(objects_after - objects_before)
+
+    if not new_objects:
+        typer.secho(
+            f"Error: No objects imported from {ply_path.name}", fg=typer.colors.RED
+        )
+        raise typer.Exit(code=1)
+
+    pointcloud_obj = new_objects[0]
+    pointcloud_obj.name = name
+
+    # Apply rotation (degrees → radians)
+    pointcloud_obj.rotation_euler = (
+        math.radians(rotation_xyz[0]),
+        math.radians(rotation_xyz[1]),
+        math.radians(rotation_xyz[2]),
+    )
+
+    typer.secho(
+        f"  ✓ {pointcloud_obj.name}  rotation=({rotation_xyz[0]:.1f}°, "
+        f"{rotation_xyz[1]:.1f}°, {rotation_xyz[2]:.1f}°)",
+        fg=typer.colors.GREEN,
+    )
+    return pointcloud_obj
+
+
 def render_to_mp4(
     output_path: Path,
     fps: int = 24,
@@ -335,6 +389,87 @@ def render_to_mp4(
         scene.frame_end = original_end
     
     return output_path
+
+
+@app.command()
+def import_pointclouds(
+    pointcloud: Path = typer.Argument(
+        ...,
+        help="Path to a single .ply file OR a folder containing .ply files",
+    ),
+    rotation_x: float = typer.Option(0.0, "--rx", help="Rotation around X axis in degrees"),
+    rotation_y: float = typer.Option(0.0, "--ry", help="Rotation around Y axis in degrees"),
+    rotation_z: float = typer.Option(0.0, "--rz", help="Rotation around Z axis in degrees"),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Output .blend file path (defaults to pointcloud stem + .blend)"
+    ),
+) -> None:
+    """Import one or all pointcloud PLY files and save a .blend file.
+
+    Provide a single .ply file to import just that cloud, or a folder path
+    to import every .ply file inside it. Each object is named 'Pointcloud'
+    (Blender auto-increments to 'Pointcloud.001', 'Pointcloud.002', … for
+    multiple clouds in the same scene).
+
+    Examples:
+        blender --background --python project2_ex1_fbx_tiktok_renderer.py -- \\
+            import-pointclouds pointclouds/McLaren_point_cloud.ply
+
+        blender --background --python project2_ex1_fbx_tiktok_renderer.py -- \\
+            import-pointclouds pointclouds/ --rx 90 --output my_clouds.blend
+    """
+    typer.secho("☁  Importing Pointcloud(s)", fg=typer.colors.CYAN, bold=True)
+    typer.echo("=" * 50)
+
+    # Gather PLY files to import
+    if pointcloud.is_dir():
+        ply_files = sorted(pointcloud.glob("*.ply"))
+        if not ply_files:
+            typer.secho(
+                f"Error: No .ply files found in {pointcloud}", fg=typer.colors.RED
+            )
+            raise typer.Exit(code=1)
+        typer.echo(f"Found {len(ply_files)} .ply file(s) in {pointcloud}")
+    elif pointcloud.suffix.lower() == ".ply":
+        ply_files = [pointcloud]
+    else:
+        typer.secho(
+            f"Error: Expected a .ply file or a folder, got: {pointcloud}",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    # Default output path
+    if output is None:
+        if pointcloud.is_dir():
+            output = pointcloud.parent / f"{pointcloud.name}_pointclouds.blend"
+        else:
+            output = pointcloud.with_suffix(".blend")
+
+    rotation_xyz = (rotation_x, rotation_y, rotation_z)
+
+    # Reset to a clean scene
+    typer.echo("Resetting scene...")
+    reset_scene()
+    ensure_object_mode()
+
+    # Import each PLY
+    imported: list[bpy.types.Object] = []
+    for ply_path in ply_files:
+        obj = import_pointcloud(ply_path, rotation_xyz=rotation_xyz, name="Pointcloud")
+        imported.append(obj)
+
+    # Summary
+    typer.echo("-" * 50)
+    typer.secho(f"✓ Imported {len(imported)} pointcloud(s):", fg=typer.colors.GREEN)
+    for obj in imported:
+        typer.echo(f"    {obj.name}")
+
+    # Save
+    save_blend_file(output)
+
+    typer.echo("=" * 50)
+    typer.secho("✨ Done!", fg=typer.colors.GREEN, bold=True)
 
 
 @app.command()
