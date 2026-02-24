@@ -555,7 +555,7 @@ def import_pointcloud_cmd(
                 raise typer.Exit(code=1)
             char_loc = (char_location[0], char_location[1], char_location[2])
         else:
-            char_loc = (0.0, 0.0, 0.0)
+            char_loc = (0.0, -1.3, -1.5)
 
         if char_rotation is not None:
             if len(char_rotation) != 3:
@@ -570,6 +570,11 @@ def import_pointcloud_cmd(
             import_and_place_fbx(fbx_file, location=char_loc, rotation_deg=char_rot)
 
     typer.echo("7. Saving blend file...")
+    # Auto-generate name from character + pointcloud stems if no explicit output given
+    if output is None and fbx_files and ply_files:
+        char_stem = fbx_files[0].stem
+        pc_stem = ply_files[0].stem
+        output = Path.cwd() / f"{char_stem}_{pc_stem}.blend"
     save_blend_file(output)
 
     typer.echo("=" * 50)
