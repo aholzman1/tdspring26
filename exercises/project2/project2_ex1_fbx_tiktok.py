@@ -323,10 +323,109 @@ def add_studio_lighting() -> None:
     typer.secho("✓ Lighting setup complete", fg=typer.colors.GREEN)
 
 
+BLENDER_BIN = Path("/Applications/Blender.app/Contents/MacOS/Blender")
+
+
+def setup_render_output(
+    output_path: Path,
+    fmt: str = "mp4",
+    frame_start: int = 1,
+    frame_end: int = 250,
+) -> None:
+    """Store frame range and output path in the scene (baked into .blend).
+
+    FFmpeg / H264 settings are applied later by the injected render script
+    running inside the full Blender binary, which has FFmpeg support.
+    """
+    scene = bpy.context.scene
+    scene.frame_start = frame_start
+    scene.frame_end = frame_end
+    scene.render.filepath = str(output_path)
+    scene.render.image_settings.file_format = "PNG"  # placeholder; overridden at render time
+
+    typer.secho(
+        f"✓ Frame range set: {frame_start}–{frame_end}  output: {output_path}",
+        fg=typer.colors.GREEN,
+    )
+
+
+def render_via_blender(
+    blend_path: Path,
+    output_path: Path,
+    fmt: str = "mp4",
+    frame_start: int = 1,
+    frame_end: int = 250,
+    single_frame: bool = False,
+) -> None:
+    """Render natively inside the full Blender binary.
+
+    Writes a small Python setup script and passes it to Blender via
+    ``--python`` so that FFmpeg / H264 settings are applied the same way
+    as ``render_to_mp4()`` in ``project2_ex1_fbx_tiktok_renderer.py``
+    — i.e. ``media_type = 'VIDEO'`` first, then ``file_format = 'FFMPEG'``.
+    """
+    import subprocess
+    import tempfile
+
+    if not BLENDER_BIN.exists():
+        typer.secho(f"Error: Blender binary not found at {BLENDER_BIN}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    output_path = output_path.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt.lower() == "png":
+        render_call = f"scene.frame_set({frame_start})\nbpy.ops.render.render(write_still=True)"
+        format_block = "scene.render.image_settings.file_format = 'PNG'"
+    else:
+        render_call = (
+            f"scene.frame_set({frame_start})\nbpy.ops.render.render(write_still=True)"
+            if single_frame
+            else "bpy.ops.render.render(animation=True, write_still=False)"
+        )
+        # Mirror render_to_mp4() from project2_ex1_fbx_tiktok_renderer.py:
+        # set media_type = 'VIDEO' *before* file_format = 'FFMPEG' — this is
+        # the key step that enables FFMPEG inside the full Blender binary.
+        format_block = "\n".join([
+            "scene.render.image_settings.media_type = 'VIDEO'",
+            "scene.render.image_settings.file_format = 'FFMPEG'",
+            "scene.render.ffmpeg.format = 'MPEG4'",
+            "scene.render.ffmpeg.codec = 'H264'",
+            "scene.render.ffmpeg.constant_rate_factor = 'HIGH'",
+            "scene.render.ffmpeg.ffmpeg_preset = 'GOOD'",
+            "scene.render.ffmpeg.audio_codec = 'AAC'",
+            "scene.render.ffmpeg.audio_bitrate = 192",
+        ])
+
+    script = (
+        "import bpy\n"
+        "scene = bpy.context.scene\n"
+        f"{format_block}\n"
+        f"scene.render.filepath = r'{output_path}'\n"
+        f"scene.frame_start = {frame_start}\n"
+        f"scene.frame_end = {frame_end}\n"
+        f"{render_call}\n"
+    )
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
+        tmp.write(script)
+        script_path = tmp.name
+
+    cmd = [str(BLENDER_BIN), "--background", str(blend_path), "--python", script_path]
+    typer.echo("Launching Blender render (native FFmpeg H264)...")
+    result = subprocess.run(cmd)
+    Path(script_path).unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        typer.secho("Error: Blender render exited with errors.", fg=typer.colors.RED)
+        raise typer.Exit(code=result.returncode)
+    typer.secho("✓ Render complete", fg=typer.colors.GREEN)
+    if output_path.exists():
+        size_mb = output_path.stat().st_size / (1024 * 1024)
+        typer.echo(f"  File size: {size_mb:.2f} MB")
+
+
 def save_blend_file(output_path: Optional[Path] = None) -> None:
-    """Save the blend file."""
-    if output_path is None:
-        output_path = Path.cwd() / SAVE_NAME
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(output_path))
@@ -465,6 +564,26 @@ def import_pointcloud_cmd(
         Optional[list[float]],
         typer.Option("--char-rotation", help="Character rotation in degrees X Y Z (pass three times, default 0 0 0)"),
     ] = None,
+    render: Annotated[
+        bool,
+        typer.Option("--render", help="Render after scene setup"),
+    ] = False,
+    render_format: Annotated[
+        str,
+        typer.Option("--render-format", help="Output format: mp4 or png"),
+    ] = "mp4",
+    single_frame: Annotated[
+        bool,
+        typer.Option("--single-frame", help="Render a single frame instead of full animation"),
+    ] = False,
+    start_frame: Annotated[
+        int,
+        typer.Option("--start-frame", help="Animation start frame"),
+    ] = 1,
+    end_frame: Annotated[
+        int,
+        typer.Option("--end-frame", help="Animation end frame"),
+    ] = 250,
 ) -> None:
     """Import one or all .ply pointclouds, apply rotation, name them 'Pointcloud',
     and attach the RadianceField geometry node group. Optionally import character FBX(s).
@@ -472,6 +591,8 @@ def import_pointcloud_cmd(
     Examples:
         python script.py import-pointcloud --pointcloud pointclouds/Hydrant.ply --rotation 0 --rotation 0 --rotation 45
         python script.py import-pointcloud --pointcloud-dir pointclouds/ --character-dir characters/
+        python script.py import-pointcloud --pointcloud pointclouds/Hydrant.ply --character characters/michelle-hiphop.fbx --render
+        python script.py import-pointcloud --pointcloud pointclouds/Hydrant.ply --character characters/michelle-hiphop.fbx --render --single-frame
     """
     typer.secho("☁️  Pointcloud Import", fg=typer.colors.CYAN, bold=True)
     typer.echo("=" * 50)
@@ -571,11 +692,47 @@ def import_pointcloud_cmd(
 
     typer.echo("7. Saving blend file...")
     # Auto-generate name from character + pointcloud stems if no explicit output given
-    if output is None and fbx_files and ply_files:
-        char_stem = fbx_files[0].stem
-        pc_stem = ply_files[0].stem
-        output = Path.cwd() / f"{char_stem}_{pc_stem}.blend"
+    char_stem = fbx_files[0].stem if fbx_files else "scene"
+    pc_stem = ply_files[0].stem if ply_files else "pointcloud"
+    base_name = f"{char_stem}_{pc_stem}"
+    if output is None:
+        output = Path.cwd() / f"{base_name}.blend"
     save_blend_file(output)
+
+    # --- Render ---
+    if render:
+        render_output_path: Path
+        if render_format.lower() == "png":
+            render_output_path = Path.cwd() / "renders" / f"{base_name}_"
+        else:
+            render_output_path = Path.cwd() / f"{base_name}.mp4"
+        render_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Set up TikTok camera and tracking, then re-save blend before rendering
+        armature = find_armature(list(bpy.data.objects))
+        if armature:
+            typer.echo("Setting up TikTok camera for render...")
+            camera = create_tiktok_camera()
+            setup_camera_tracking(camera, armature, TARGET_BONE_NAME, start_frame, end_frame)
+            add_studio_lighting()
+
+        typer.echo(f"8. Configuring render output: {render_output_path}")
+        setup_render_output(render_output_path, fmt=render_format, frame_start=start_frame, frame_end=end_frame)
+
+        # Re-save blend with render settings baked in
+        save_blend_file(output)
+
+        typer.echo("9. Launching Blender for render...")
+        render_via_blender(
+            blend_path=output,
+            output_path=render_output_path,
+            fmt=render_format,
+            frame_start=start_frame,
+            frame_end=end_frame,
+            single_frame=single_frame,
+        )
+    else:
+        typer.echo("Skipping render (use --render to render).")
 
     typer.echo("=" * 50)
     typer.secho("✨ Pointcloud import complete!", fg=typer.colors.GREEN, bold=True)
@@ -583,7 +740,9 @@ def import_pointcloud_cmd(
     typer.echo(f"Bounding box: {bbox}")
     if fbx_files:
         typer.echo(f"Imported {len(fbx_files)} character(s) at location {char_loc}, rotation {char_rot}")
-    typer.echo("Open the .blend in Blender to verify the scene.")
+    typer.echo(f"Saved: {output}")
+    if render:
+        typer.echo(f"Render output: {render_output_path}")
 
 
 if __name__ == "__main__":
