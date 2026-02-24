@@ -118,7 +118,50 @@ def set_bounding_box(
     )
 
 
+def place_character(
+    imported_objects: list[bpy.types.Object],
+    location: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    rotation_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> Optional[bpy.types.Object]:
+    """Set location and rotation on the root/armature of an imported FBX character.
+
+    Returns the armature (or first object if no armature found).
+    """
+    armature = find_armature(imported_objects)
+    root = armature if armature else (imported_objects[0] if imported_objects else None)
+    if root is None:
+        typer.secho("Warning: No objects to place for character.", fg=typer.colors.YELLOW)
+        return None
+
+    root.location = location
+    root.rotation_euler = (
+        math.radians(rotation_deg[0]),
+        math.radians(rotation_deg[1]),
+        math.radians(rotation_deg[2]),
+    )
+    typer.secho(
+        f"✓ Placed '{root.name}' at {location}, rotation={rotation_deg[0]}°, "
+        f"{rotation_deg[1]}°, {rotation_deg[2]}°",
+        fg=typer.colors.GREEN,
+    )
+    return root
+
+
+def import_and_place_fbx(
+    fbx_path: Path,
+    location: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    rotation_deg: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> list[bpy.types.Object]:
+    """Import an FBX and immediately place it at the given location/rotation."""
+    imported = import_fbx(fbx_path)
+    place_character(imported, location=location, rotation_deg=rotation_deg)
+    return imported
+
+
+
 def reset_scene() -> None:
+    """Reset to a clean empty scene — no default cube, camera, or light."""
+    bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.context.scene.render.engine = "BLENDER_EEVEE"
 
     # TikTok aspect ratio: 9:16 (vertical video)
@@ -406,13 +449,29 @@ def import_pointcloud_cmd(
         Optional[list[float]],
         typer.Option("--bounding-box", "-b", help="Bounding box X Y Z (pass three times, default 4 4 8)"),
     ] = None,
+    character: Annotated[
+        Optional[Path],
+        typer.Option("--character", "-c", help="Path to a single character FBX file"),
+    ] = None,
+    character_dir: Annotated[
+        Optional[Path],
+        typer.Option("--character-dir", help="Directory of FBX files to import all characters"),
+    ] = None,
+    char_location: Annotated[
+        Optional[list[float]],
+        typer.Option("--char-location", help="Character location X Y Z (pass three times, default 0 0 0)"),
+    ] = None,
+    char_rotation: Annotated[
+        Optional[list[float]],
+        typer.Option("--char-rotation", help="Character rotation in degrees X Y Z (pass three times, default 0 0 0)"),
+    ] = None,
 ) -> None:
     """Import one or all .ply pointclouds, apply rotation, name them 'Pointcloud',
-    and attach the RadianceField geometry node group.
+    and attach the RadianceField geometry node group. Optionally import character FBX(s).
 
     Examples:
         python script.py import-pointcloud --pointcloud pointclouds/Hydrant.ply --rotation 0 --rotation 0 --rotation 45
-        python script.py import-pointcloud --pointcloud-dir pointclouds/
+        python script.py import-pointcloud --pointcloud-dir pointclouds/ --character-dir characters/
     """
     typer.secho("☁️  Pointcloud Import", fg=typer.colors.CYAN, bold=True)
     typer.echo("=" * 50)
@@ -476,6 +535,40 @@ def import_pointcloud_cmd(
             bbox = (4.0, 4.0, 8.0)
         set_bounding_box(obj, bbox)
 
+    # --- Character import ---
+    fbx_files: list[Path] = []
+    if character is not None:
+        fbx_files = [character]
+    elif character_dir is not None:
+        character_dir = character_dir.expanduser().resolve()
+        fbx_files = sorted(character_dir.glob("*.fbx"))
+        if not fbx_files:
+            typer.secho(f"Warning: No .fbx files found in {character_dir}", fg=typer.colors.YELLOW)
+
+    if fbx_files:
+        # Parse character location / rotation
+        char_loc: tuple[float, float, float]
+        char_rot: tuple[float, float, float]
+        if char_location is not None:
+            if len(char_location) != 3:
+                typer.secho("Error: --char-location requires exactly 3 values.", fg=typer.colors.RED)
+                raise typer.Exit(code=1)
+            char_loc = (char_location[0], char_location[1], char_location[2])
+        else:
+            char_loc = (0.0, 0.0, 0.0)
+
+        if char_rotation is not None:
+            if len(char_rotation) != 3:
+                typer.secho("Error: --char-rotation requires exactly 3 values.", fg=typer.colors.RED)
+                raise typer.Exit(code=1)
+            char_rot = (char_rotation[0] + 90.0, char_rotation[1], char_rotation[2])
+        else:
+            char_rot = (90.0, 0.0, 0.0)
+
+        typer.echo(f"Importing {len(fbx_files)} character(s)...")
+        for fbx_file in fbx_files:
+            import_and_place_fbx(fbx_file, location=char_loc, rotation_deg=char_rot)
+
     typer.echo("7. Saving blend file...")
     save_blend_file(output)
 
@@ -483,7 +576,9 @@ def import_pointcloud_cmd(
     typer.secho("✨ Pointcloud import complete!", fg=typer.colors.GREEN, bold=True)
     typer.echo(f"Imported {len(ply_files)} pointcloud(s) with rotation {rot}")
     typer.echo(f"Bounding box: {bbox}")
-    typer.echo("Open the .blend in Blender to verify the GeometryNodes modifier.")
+    if fbx_files:
+        typer.echo(f"Imported {len(fbx_files)} character(s) at location {char_loc}, rotation {char_rot}")
+    typer.echo("Open the .blend in Blender to verify the scene.")
 
 
 if __name__ == "__main__":
