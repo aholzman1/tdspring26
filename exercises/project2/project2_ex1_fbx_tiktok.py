@@ -21,7 +21,11 @@ RADIANCE_FIELD_BLEND = Path(__file__).parent / "radiancefield.blend"
 RADIANCE_FIELD_NODE_GROUP = "RadianceField"
 FRAME_STEP = 5  # Bake keyframes every N frames
 CAMERA_DISTANCE = 2.5  # Distance from target in meters
-CAMERA_HEIGHT_OFFSET = 1.5  # Height above target center
+CAMERA_HEIGHT_OFFSET = 0.0  # Camera at same height as tracked bone
+CAMERA_LOOK_UP_OFFSET = 0.3  # Look slightly above tracked bone for better full-body framing
+CAMERA_VERTICAL_FILL = 0.72  # Portion of frame height the character should occupy
+CAMERA_HORIZONTAL_FILL = 0.65  # Portion of frame width the character should occupy
+CAMERA_DISTANCE_PADDING = 1.1  # Extra breathing room around the character
 TARGET_BONE_NAME = "mixamorig:Hips"  # Common Mixamo bone name
 
 
@@ -208,17 +212,172 @@ def find_armature(
     return None
 
 
+def resolve_tracking_bone_name(
+    armature: bpy.types.Object,
+    bone_name: Optional[str],
+) -> Optional[str]:
+    """Resolve the requested tracking bone to the actual FBX armature bone name."""
+    if bone_name is None:
+        return None
+
+    if bone_name in armature.pose.bones:
+        return bone_name
+
+    target_suffix = bone_name.split(":")[-1].lower()
+    for candidate in armature.pose.bones.keys():
+        if candidate.split(":")[-1].lower() == target_suffix:
+            return candidate
+
+    for candidate in ("Hips", "mixamorig:Hips", "mixamorig1:Hips", "Pelvis", "pelvis"):
+        if candidate in armature.pose.bones:
+            return candidate
+
+    return None
+
+
 def get_target_world_location(
     armature: bpy.types.Object, bone_name: str
 ) -> tuple[float, float, float]:
-    """Get world location of a bone in the armature."""
+    """Get world location of a bone in the armature.
+
+    If the bone is not found, estimates hip height by adding ~0.9 m in world Z
+    to the armature root (which is typically at foot level after Mixamo import).
+    """
     if bone_name in armature.pose.bones:
         bone = armature.pose.bones[bone_name]
         matrix = armature.matrix_world @ bone.matrix
         return tuple(matrix.translation)
 
-    # Fallback to armature origin
-    return tuple(armature.matrix_world.translation)
+    # Fallback: armature root is at foot level — add ~0.9 m to estimate hips
+    root = tuple(armature.matrix_world.translation)
+    return (root[0], root[1], root[2] + 0.9)
+
+
+def get_character_mesh_objects(
+    character_objects: list[bpy.types.Object],
+) -> list[bpy.types.Object]:
+    """Return mesh objects used to frame the character."""
+    return [obj for obj in character_objects if obj.type == "MESH"]
+
+
+def get_object_world_bounds(
+    obj: bpy.types.Object,
+    depsgraph: bpy.types.Depsgraph,
+) -> Optional[tuple[float, float, float, float, float, float]]:
+    """Return evaluated world-space bounds for an object as min/max XYZ."""
+    obj_eval = obj.evaluated_get(depsgraph)
+    bound_box = getattr(obj_eval, "bound_box", None)
+    if not bound_box:
+        return None
+
+    world_corners = [obj_eval.matrix_world @ Vector(corner) for corner in bound_box]
+    xs = [corner.x for corner in world_corners]
+    ys = [corner.y for corner in world_corners]
+    zs = [corner.z for corner in world_corners]
+    return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+
+
+def get_character_frame_bounds(
+    character_objects: list[bpy.types.Object],
+    depsgraph: bpy.types.Depsgraph,
+) -> Optional[dict[str, float]]:
+    """Return combined evaluated bounds for the full character on the current frame."""
+    mesh_objects = get_character_mesh_objects(character_objects)
+    if not mesh_objects:
+        return None
+
+    bounds = [get_object_world_bounds(obj, depsgraph) for obj in mesh_objects]
+    bounds = [item for item in bounds if item is not None]
+    if not bounds:
+        return None
+
+    min_x = min(item[0] for item in bounds)
+    max_x = max(item[1] for item in bounds)
+    min_y = min(item[2] for item in bounds)
+    max_y = max(item[3] for item in bounds)
+    min_z = min(item[4] for item in bounds)
+    max_z = max(item[5] for item in bounds)
+
+    return {
+        "min_x": min_x,
+        "max_x": max_x,
+        "min_y": min_y,
+        "max_y": max_y,
+        "min_z": min_z,
+        "max_z": max_z,
+        "center_x": (min_x + max_x) / 2,
+        "center_y": (min_y + max_y) / 2,
+        "center_z": (min_z + max_z) / 2,
+        "width": max_x - min_x,
+        "depth": max_y - min_y,
+        "height": max_z - min_z,
+    }
+
+
+def analyze_character_framing(
+    camera: bpy.types.Object,
+    target: bpy.types.Object,
+    character_objects: list[bpy.types.Object],
+    bone_name: Optional[str],
+    frame_start: int,
+    frame_end: int,
+) -> dict[str, object]:
+    """Sample animated bounds to derive a camera distance that fits the full body."""
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    samples: dict[int, dict[str, float]] = {}
+    max_height = 0.0
+    max_width = 0.0
+    center_offset_z_total = 0.0
+    sample_count = 0
+
+    for frame in range(frame_start, frame_end + 1, FRAME_STEP):
+        scene.frame_set(frame)
+        depsgraph.update()
+
+        if target.type == "ARMATURE" and bone_name:
+            target_loc = get_target_world_location(target, bone_name)
+        else:
+            target_loc = tuple(target.matrix_world.translation)
+
+        bounds = get_character_frame_bounds(character_objects, depsgraph)
+        if bounds is None:
+            continue
+
+        samples[frame] = bounds
+        max_height = max(max_height, bounds["height"])
+        max_width = max(max_width, bounds["width"])
+        center_offset_z_total += bounds["center_z"] - target_loc[2]
+        sample_count += 1
+
+    vertical_angle = camera.data.angle_y
+    horizontal_angle = camera.data.angle_x
+
+    vertical_distance = CAMERA_DISTANCE
+    horizontal_distance = CAMERA_DISTANCE
+    if max_height > 0:
+        vertical_distance = (max_height / 2) / math.tan(vertical_angle / 2)
+        vertical_distance /= CAMERA_VERTICAL_FILL
+    if max_width > 0:
+        horizontal_distance = (max_width / 2) / math.tan(horizontal_angle / 2)
+        horizontal_distance /= CAMERA_HORIZONTAL_FILL
+
+    camera_distance = max(CAMERA_DISTANCE, vertical_distance, horizontal_distance)
+    camera_distance *= CAMERA_DISTANCE_PADDING
+    fallback_center_offset_z = (
+        center_offset_z_total / sample_count if sample_count else CAMERA_HEIGHT_OFFSET
+    )
+
+    typer.echo(
+        "  Adaptive framing: "
+        f"height={max_height:.2f}m width={max_width:.2f}m distance={camera_distance:.2f}m"
+    )
+
+    return {
+        "camera_distance": camera_distance,
+        "fallback_center_offset_z": fallback_center_offset_z,
+        "samples": samples,
+    }
 
 
 def create_tiktok_camera(name: str = "TikTokCamera") -> bpy.types.Object:
@@ -242,6 +401,7 @@ def create_tiktok_camera(name: str = "TikTokCamera") -> bpy.types.Object:
 def setup_camera_tracking(
     camera: bpy.types.Object,
     target: bpy.types.Object,
+    character_objects: Optional[list[bpy.types.Object]] = None,
     bone_name: Optional[str] = None,
     frame_start: int = 1,
     frame_end: int = 250,
@@ -254,35 +414,73 @@ def setup_camera_tracking(
         camera.animation_data_clear()
 
     scene = bpy.context.scene
+    character_objects = character_objects or [target]
+    resolved_bone_name = bone_name
+
+    if target.type == "ARMATURE" and bone_name:
+        resolved_bone_name = resolve_tracking_bone_name(target, bone_name)
+        if resolved_bone_name:
+            if resolved_bone_name == bone_name:
+                typer.echo(f"  Tracking movement from bone '{resolved_bone_name}'")
+            else:
+                typer.echo(
+                    f"  Tracking movement from bone '{resolved_bone_name}' (resolved from '{bone_name}')"
+                )
+        else:
+            typer.secho(
+                f"  ⚠ Bone '{bone_name}' not found — falling back to estimated hip position",
+                fg=typer.colors.YELLOW,
+            )
+
+    framing = analyze_character_framing(
+        camera,
+        target,
+        character_objects,
+        resolved_bone_name,
+        frame_start,
+        frame_end,
+    )
+    camera_distance = float(framing["camera_distance"])
+    fallback_center_offset_z = float(framing["fallback_center_offset_z"])
+    frame_samples = framing["samples"]
 
     # Bake keyframes
     for frame in range(frame_start, frame_end + 1, FRAME_STEP):
         scene.frame_set(frame)
 
         # Get target location
-        if target.type == "ARMATURE" and bone_name:
-            target_loc = get_target_world_location(target, bone_name)
+        if target.type == "ARMATURE" and resolved_bone_name:
+            target_loc = get_target_world_location(target, resolved_bone_name)
         else:
             target_loc = tuple(target.matrix_world.translation)
 
-        # Position camera behind and above target
+        bounds = frame_samples.get(frame)
+        focus_x = bounds["center_x"] if bounds else target_loc[0]
+        focus_y = target_loc[1]
+        focus_z = bounds["center_z"] if bounds else (target_loc[2] + fallback_center_offset_z)
+
+        # Position camera behind the character at a distance derived from full-body size
         camera.location = (
-            target_loc[0],
-            target_loc[1] - CAMERA_DISTANCE,
-            target_loc[2] + CAMERA_HEIGHT_OFFSET,
+            focus_x,
+            focus_y - camera_distance,
+            focus_z,
         )
 
-        # Point camera at target
+        # Keep the full body centered for the duration of the animation
+        look_at = (
+            focus_x,
+            focus_y,
+            focus_z + CAMERA_LOOK_UP_OFFSET,
+        )
         direction = Vector(
             (
-                target_loc[0] - camera.location[0],
-                target_loc[1] - camera.location[1],
-                target_loc[2] - camera.location[2],
+                look_at[0] - camera.location[0],
+                look_at[1] - camera.location[1],
+                look_at[2] - camera.location[2],
             )
         )
 
         # Calculate rotation to look at target
-        rot_quat = camera.rotation_euler.to_quaternion()
         track_quat = direction.to_track_quat("-Z", "Y")
         camera.rotation_euler = track_quat.to_euler()
 
@@ -407,18 +605,38 @@ def render_via_blender(
         f"{render_call}\n"
     )
 
+    import re
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
         tmp.write(script)
         script_path = tmp.name
 
+    total_frames = frame_end - frame_start + 1
     cmd = [str(BLENDER_BIN), "--background", str(blend_path), "--python", script_path]
     typer.echo("Launching Blender render (native FFmpeg H264)...")
-    result = subprocess.run(cmd)
+
+    last_pct = -1
+    returncode = 0
+    with subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    ) as proc:
+        for line in proc.stdout:
+            m = re.search(r"Video append frame (\d+)", line)
+            if m:
+                frame_num = int(m.group(1))
+                pct = int((frame_num - frame_start + 1) / total_frames * 100)
+                if pct != last_pct:  # only reprint when percentage changes
+                    last_pct = pct
+                    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+                    print(f"\r  [{bar}] {pct:3d}%  frame {frame_num}/{frame_end}", end="", flush=True)
+        returncode = proc.wait()
+
+    print()  # newline after progress bar
     Path(script_path).unlink(missing_ok=True)
 
-    if result.returncode != 0:
+    if returncode != 0:
         typer.secho("Error: Blender render exited with errors.", fg=typer.colors.RED)
-        raise typer.Exit(code=result.returncode)
+        raise typer.Exit(code=returncode)
     typer.secho("✓ Render complete", fg=typer.colors.GREEN)
     if output_path.exists():
         size_mb = output_path.stat().st_size / (1024 * 1024)
@@ -500,7 +718,14 @@ def create(
 
     # Step 6: Setup tracking
     typer.echo("5. Setting up camera tracking...")
-    setup_camera_tracking(camera, target, target_bone, start_frame, end_frame)
+    setup_camera_tracking(
+        camera,
+        target,
+        imported_objects,
+        target_bone,
+        start_frame,
+        end_frame,
+    )
 
     # Step 7: Add lighting
     if not no_lights:
@@ -666,6 +891,7 @@ def import_pointcloud_cmd(
         if not fbx_files:
             typer.secho(f"Warning: No .fbx files found in {character_dir}", fg=typer.colors.YELLOW)
 
+    imported_character_objects: list[bpy.types.Object] = []
     if fbx_files:
         # Parse character location / rotation
         char_loc: tuple[float, float, float]
@@ -688,7 +914,11 @@ def import_pointcloud_cmd(
 
         typer.echo(f"Importing {len(fbx_files)} character(s)...")
         for fbx_file in fbx_files:
-            import_and_place_fbx(fbx_file, location=char_loc, rotation_deg=char_rot)
+            imported_character_objects = import_and_place_fbx(
+                fbx_file,
+                location=char_loc,
+                rotation_deg=char_rot,
+            )
 
     typer.echo("7. Saving blend file...")
     # Auto-generate name from character + pointcloud stems if no explicit output given
@@ -713,7 +943,14 @@ def import_pointcloud_cmd(
         if armature:
             typer.echo("Setting up TikTok camera for render...")
             camera = create_tiktok_camera()
-            setup_camera_tracking(camera, armature, TARGET_BONE_NAME, start_frame, end_frame)
+            setup_camera_tracking(
+                camera,
+                armature,
+                imported_character_objects,
+                TARGET_BONE_NAME,
+                start_frame,
+                end_frame,
+            )
             add_studio_lighting()
 
         typer.echo(f"8. Configuring render output: {render_output_path}")
