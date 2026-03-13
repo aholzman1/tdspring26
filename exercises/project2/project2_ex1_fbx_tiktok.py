@@ -920,28 +920,19 @@ def import_pointcloud_cmd(
                 rotation_deg=char_rot,
             )
 
-    typer.echo("7. Saving blend file...")
     # Auto-generate name from character + pointcloud stems if no explicit output given
     char_stem = fbx_files[0].stem if fbx_files else "scene"
     pc_stem = ply_files[0].stem if ply_files else "pointcloud"
     base_name = f"{char_stem}_{pc_stem}"
     if output is None:
         output = Path.cwd() / f"{base_name}.blend"
-    save_blend_file(output)
 
-    # --- Render ---
-    if render:
-        render_output_path: Path
-        if render_format.lower() == "png":
-            render_output_path = Path.cwd() / "renders" / f"{base_name}_"
-        else:
-            render_output_path = Path.cwd() / f"{base_name}.mp4"
-        render_output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Set up TikTok camera and tracking, then re-save blend before rendering
-        armature = find_armature(list(bpy.data.objects))
+    # Always set up camera + lighting when a character is present so the blend
+    # file is ready to preview from the active camera (Numpad 0).
+    if fbx_files:
+        armature = find_armature(imported_character_objects)
         if armature:
-            typer.echo("Setting up TikTok camera for render...")
+            typer.echo("Setting up TikTok camera...")
             camera = create_tiktok_camera()
             setup_camera_tracking(
                 camera,
@@ -952,6 +943,18 @@ def import_pointcloud_cmd(
                 end_frame,
             )
             add_studio_lighting()
+
+    typer.echo("7. Saving blend file...")
+    save_blend_file(output)
+
+    # --- Render ---
+    if render:
+        render_output_path: Path
+        if render_format.lower() == "png":
+            render_output_path = Path.cwd() / "renders" / f"{base_name}_"
+        else:
+            render_output_path = Path.cwd() / f"{base_name}.mp4"
+        render_output_path.parent.mkdir(parents=True, exist_ok=True)
 
         typer.echo(f"8. Configuring render output: {render_output_path}")
         setup_render_output(render_output_path, fmt=render_format, frame_start=start_frame, frame_end=end_frame)
